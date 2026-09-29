@@ -1,0 +1,305 @@
+// Haze Monitor data model.
+//
+// Design notes:
+//  * Probe <-> Target is a many-to-many (ProbeTarget). Assignments are materialised (auto-created from
+//    Target.regions when a target/probe is created) so the scheduler only ever reads one table and
+//    operators may still hand-pick probes. ProbeTarget also holds the per-(probe,target) state machine.
+//  * TargetState is the aggregate (cross-probe) state + classification for a target.
+//  * CheckJob is a Postgres-backed queue: probes pull jobs (outbound-only connections), so no
+//    Redis is needed and no probe needs an inbound port.
+//  * Alert is a transactional outbox: rows are created together with state changes and delivered by the
+//    notifier with retries, so a Telegram outage never loses an alert.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TargetType {
+  ORIGIN
+  CDN
+  PANEL
+  SUBSCRIPTION
+  API
+  CUSTOM
+}
+
+enum CheckType {
+  NETWORK // DNS -> TCP -> TLS -> HTTP pipeline
+  XRAY_E2E // reserved: real VPN tunnel check (not implemented yet)
+}
+
+enum HealthState {
+  UNKNOWN
+  UP
+  DEGRADED
+  DOWN
+}
+
+enum Classification {
+  HEALTHY
+  DEGRADED
+  RU_UNAVAILABLE
+  REGIONAL_OUTAGE
+  GLOBAL_OUTAGE
+  PROBE_UNAVAILABLE
+  UNKNOWN
+}
+
+enum ProbeStatus {
+  UNKNOWN
+  ONLINE
+  OFFLINE
+}
+
+enum JobKind {
+  SCHEDULED
+  MANUAL
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  DONE
+  EXPIRED
+}
+
+enum CheckStage {
+  DNS
+  TCP
+  TLS
+  HTTP
+}
+
+enum AlertType {
+  TARGET_DOWN
+  TARGET_RECOVERED
+  TARGET_REMINDER
+  PROBE_DOWN
+  PROBE_RECOVERED
+  CERT_EXPIRING
+}
+
+enum AlertStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum Granularity {
+  HOUR
+  DAY
+}
+
+model InfraGroup {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  flag        String   @default("🌐")
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  targets     MonitoringTarget[]
+}
+
+model MonitoringTarget {
+  id                  String     @id @default(cuid())
+  name                String     @unique
+  type                TargetType @default(CUSTOM)
+  checkType           CheckType  @default(NETWORK)
+  hostname            String
+  protocol            String     @default("https") // http | https
+  port                Int        @default(443)
+  path                String     @default("/")
+  enabled             Boolean    @default(true)
+  intervalSeconds     Int        @default(30)
+  timeoutMs           Int        @default(5000)
+  failureThreshold    Int        @default(3)
+  recoveryThreshold   Int        @default(2)
+  expectedStatusCodes Int[]      @default([200, 301, 302, 403, 404])
+  certWarnDays        Int        @default(7)
+  regions             String[]   @default(["RU", "EU"]) // regions that must probe this target
+  allowPrivate        Boolean    @default(false) // explicit SSRF-guard opt-out for internal infra
+  groupId             String?
+  group               InfraGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  probes     ProbeTarget[]
+  results    CheckResult[]
+  jobs       CheckJob[]
+  state      TargetState?
+  incidents  Incident[]
+  aggregates CheckAggregate[]
+
+  @@index([enabled])
+  @@index([groupId])
+}
+
+model Probe {
+  id            String      @id @default(cuid())
+  name          String      @unique
+  region        String // RU | EU | ...
+  countryCode   String      @default("")
+  location      String      @default("")
+  provider      String      @default("")
+  enabled       Boolean     @default(true)
+  status        ProbeStatus @default(UNKNOWN)
+  lastSeenAt    DateTime?
+  statusSince   DateTime    @default(now())
+  version       String?
+  publicIp      String?
+  secretVersion Int         @default(1) // bump to rotate the probe token
+  createdAt     DateTime    @default(now())
+
+  targets ProbeTarget[]
+  results CheckResult[]
+  jobs    CheckJob[]
+  aggregates CheckAggregate[]
+
+  @@index([region])
+}
+
+model ProbeTarget {
+  probeId  String
+  targetId String
+  probe    Probe            @relation(fields: [probeId], references: [id], onDelete: Cascade)
+  target   MonitoringTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+
+  // per-(probe,target) state machine
+  state        HealthState @default(UNKNOWN)
+  failStreak   Int         @default(0)
+  okStreak     Int         @default(0)
+  stateSince   DateTime    @default(now())
+  lastCheckAt  DateTime?
+  nextRunAt    DateTime    @default(now())
+  lastError    String?
+
+  @@id([probeId, targetId])
+  @@index([nextRunAt])
+}
+
+model CheckJob {
+  id           String    @id @default(cuid()) // doubles as correlation / check id
+  targetId     String
+  probeId      String
+  kind         JobKind   @default(SCHEDULED)
+  status       JobStatus @default(PENDING)
+  batchId      String?
+  createdAt    DateTime  @default(now())
+  claimedAt    DateTime?
+  expiresAt    DateTime
+  completedAt  DateTime?
+
+  target MonitoringTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+  probe  Probe            @relation(fields: [probeId], references: [id], onDelete: Cascade)
+  result CheckResult?
+
+  @@index([probeId, status, createdAt])
+  @@index([batchId])
+  @@index([status, expiresAt])
+}
+
+model CheckResult {
+  id        String   @id @default(cuid())
+  jobId     String?  @unique
+  targetId  String
+  probeId   String
+  kind      JobKind  @default(SCHEDULED)
+  createdAt DateTime @default(now()) // = time check finished on the probe
+  success   Boolean
+  failedStage CheckStage?
+
+  dnsSuccess   Boolean?
+  dnsLatencyMs Int?
+  tcpSuccess   Boolean?
+  tcpLatencyMs Int?
+  tlsSuccess   Boolean?
+  tlsLatencyMs Int?
+  httpSuccess  Boolean?
+  httpStatus   Int?
+  httpLatencyMs Int?
+  totalLatencyMs Int?
+
+  resolvedIp      String?
+  tlsCertExpiresAt DateTime?
+  tlsCertDaysLeft  Int?
+  errorType       String?
+  errorMessage    String?
+
+  job    CheckJob?        @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  target MonitoringTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+  probe  Probe            @relation(fields: [probeId], references: [id], onDelete: Cascade)
+
+  @@index([targetId, probeId, createdAt(sort: Desc)])
+  @@index([createdAt])
+}
+
+// Retention: raw CheckResult 7d -> hourly aggregates 90d -> daily aggregates kept long-term.
+model CheckAggregate {
+  targetId    String
+  probeId     String
+  granularity Granularity
+  bucket      DateTime // start of hour / day (UTC)
+  total       Int
+  ok          Int
+  avgLatencyMs Int?
+  maxLatencyMs Int?
+
+  target MonitoringTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+  probe  Probe            @relation(fields: [probeId], references: [id], onDelete: Cascade)
+
+  @@id([targetId, probeId, granularity, bucket])
+  @@index([granularity, bucket])
+}
+
+model TargetState {
+  targetId       String         @id
+  status         HealthState    @default(UNKNOWN)
+  classification Classification @default(UNKNOWN)
+  regionStates   Json           @default("{}") // { RU: "DOWN", EU: "UP" }
+  reason         String?
+  since          DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  target MonitoringTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+}
+
+model Incident {
+  id              String         @id @default(cuid())
+  targetId        String
+  startedAt       DateTime       @default(now())
+  resolvedAt      DateTime?
+  classification  Classification @default(UNKNOWN)
+  affectedRegions String[]
+  reason          String?
+  lastReminderAt  DateTime?
+
+  target MonitoringTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+  alerts Alert[]
+
+  @@index([targetId, resolvedAt])
+  @@index([startedAt])
+}
+
+model Alert {
+  id          String      @id @default(cuid())
+  type        AlertType
+  channel     String      @default("telegram")
+  recipient   String // telegram chat id
+  dedupeKey   String      @unique // "<event>:<recipient>" -> exactly-once creation
+  incidentId  String?
+  payload     Json
+  status      AlertStatus @default(PENDING)
+  attempts    Int         @default(0)
+  nextAttemptAt DateTime  @default(now())
+  lastError   String?
+  createdAt   DateTime    @default(now())
+  sentAt      DateTime?
+
+  incident Incident? @relation(fields: [incidentId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextAttemptAt])
+}

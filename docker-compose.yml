@@ -1,0 +1,86 @@
+# Haze Monitor — central server.  Usage:  cp .env.example .env && nano .env && docker compose up -d
+name: haze-monitor
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+x-backend: &backend
+  image: ${BACKEND_IMAGE:-haze-monitor-backend:local}
+  build: { context: ., target: backend }
+  environment: &backend-env
+    DATABASE_URL: postgresql://haze:${DATABASE_PASSWORD}@postgres:5432/haze?schema=public
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+    TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:?set TELEGRAM_ADMIN_IDS in .env}
+    PROBE_SIGNING_SECRET: ${PROBE_SIGNING_SECRET:?set PROBE_SIGNING_SECRET in .env}
+    PUBLIC_URL: ${PUBLIC_URL:-}
+    PROBE_IMAGE: ${PROBE_IMAGE:-ghcr.io/OWNER/haze-monitor-probe:latest}
+    TZ: ${TZ:-UTC}
+    CHECK_INTERVAL: ${CHECK_INTERVAL:-30}
+    CHECK_TIMEOUT: ${CHECK_TIMEOUT:-5000}
+    FAILURE_THRESHOLD: ${FAILURE_THRESHOLD:-3}
+    RECOVERY_THRESHOLD: ${RECOVERY_THRESHOLD:-2}
+    REMINDER_MINUTES: ${REMINDER_MINUTES:-0}
+    PROBE_OFFLINE_AFTER: ${PROBE_OFFLINE_AFTER:-90}
+    RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS:-7}
+    HOURLY_RETENTION_DAYS: ${HOURLY_RETENTION_DAYS:-90}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+  logging: *logging
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: monitor-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: haze
+      POSTGRES_DB: haze
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?set DATABASE_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U haze -d haze"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  # One-shot init container: applies Prisma migrations exactly once per deployment (no races between replicas).
+  migrate:
+    <<: *backend
+    container_name: monitor-migrate
+    command: ["npx", "prisma", "migrate", "deploy"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # API for probes + scheduler + evaluator + notifier + Telegram bot (modular monolith, one process).
+  backend:
+    <<: *backend
+    container_name: monitor-backend
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports:
+      - "${BACKEND_BIND:-0.0.0.0}:${BACKEND_PORT:-3000}:3000"
+
+  # Optional HTTPS reverse proxy: set COMPOSE_PROFILES=tls and DOMAIN in .env (see README).
+  caddy:
+    image: caddy:2-alpine
+    container_name: monitor-caddy
+    profiles: ["tls"]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      backend: { condition: service_healthy }
+    logging: *logging
+
+volumes:
+  pgdata:
+  caddy_data:

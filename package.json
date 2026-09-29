@@ -1,0 +1,23 @@
+{
+  "name": "haze-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Haze Infrastructure Monitoring System (backend + probe agent)",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start:backend": "node dist/backend/main.js",
+    "start:probe": "node dist/probe/main.js",
+    "test": "node --test dist/tests/engine.test.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.0",
+    "grammy": "^1.38.0",
+    "prisma": "^6.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

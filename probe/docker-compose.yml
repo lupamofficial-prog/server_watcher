@@ -1,0 +1,15 @@
+# Haze Monitor probe.  Usage:  cp .env.example .env && nano .env && docker compose up -d
+# (builds locally from this repository; use install.sh for the prebuilt-image flow)
+name: haze-probe
+services:
+  probe:
+    image: ${PROBE_IMAGE:-haze-monitor-probe:local}
+    build: { context: .., target: probe }
+    container_name: monitor-probe
+    restart: unless-stopped
+    env_file: .env
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
